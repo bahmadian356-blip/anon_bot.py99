@@ -1,0 +1,973 @@
+import os
+import json
+import time
+import uuid
+import hmac
+import hashlib
+import secrets
+import asyncio
+import logging
+import threading
+import requests
+from urllib.parse import parse_qsl
+from datetime import datetime
+
+from flask import Flask, request, jsonify
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ================= تنظیمات پایه =================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "")  # مثلا: my_cool_bot (بدون @)
+ADMIN_IDS = set(
+    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
+)
+MINIAPP_URL = os.environ.get("MINIAPP_URL", "")  # آدرس همین سرویس رو Render، بعد از دیپلوی پر میشه
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+RATE_LIMIT_COUNT = 5          # حداکثر پیام
+RATE_LIMIT_WINDOW = 60        # در این بازه (ثانیه)
+DUPLICATE_WINDOW = 15         # جلوگیری از پیام تکراری در این بازه (ثانیه)
+
+DATA_LOCK = threading.Lock()
+MAIN_LOOP = None  # بعد از استارت بات پر میشه، برای صدا زدن bot.send_message از Flask
+
+
+# ================= ذخیره‌سازی (JSON) =================
+def _default_data():
+    return {
+        "tokens": {},            # public_token -> user_id
+        "user_token": {},        # user_id(str) -> public_token
+        "conversations": {},     # conv_id -> {user_a, user_b, active}
+        "messages": [],          # لیست پیام‌ها
+        "blocks": {},            # blocker_id(str) -> [blocked_id, ...]
+        "reports": [],           # گزارش‌ها
+        "settings": {},          # user_id(str) -> {receive, notify, show_seen}
+        "rate": {},              # user_id(str) -> [timestamps]
+    }
+
+
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def load_data():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        logger.error("SUPABASE_URL / SUPABASE_SERVICE_KEY تنظیم نشده؛ داده‌ی خالی برگردانده شد.")
+        return _default_data()
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/kv_store",
+            params={"id": "eq.1", "select": "data"},
+            headers=_supabase_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if rows and rows[0].get("data") is not None:
+            return rows[0]["data"]
+    except Exception as e:
+        logger.error(f"load_data (supabase) failed: {e}")
+    return _default_data()
+
+
+def save_data(data):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return
+    try:
+        resp = requests.patch(
+            f"{SUPABASE_URL}/rest/v1/kv_store",
+            params={"id": "eq.1"},
+            json={"data": data},
+            headers={**_supabase_headers(), "Prefer": "return=minimal"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"save_data (supabase) failed: {e}")
+
+
+def mutate(fn):
+    """با قفل، دیتا رو میخونه، fn(data) رو صدا میزنه، ذخیره میکنه و نتیجه رو برمیگردونه."""
+    with DATA_LOCK:
+        data = load_data()
+        result = fn(data)
+        save_data(data)
+        return result
+
+
+def get_settings(data, user_id):
+    return data["settings"].setdefault(
+        str(user_id), {"receive": True, "notify": True, "show_seen": True}
+    )
+
+
+# ================= منطق پایه =================
+def get_or_create_link(data, user_id):
+    uid = str(user_id)
+    token = data["user_token"].get(uid)
+    if token and data["tokens"].get(token) == user_id:
+        return token
+    return regenerate_link(data, user_id)
+
+
+def regenerate_link(data, user_id):
+    uid = str(user_id)
+    old_token = data["user_token"].get(uid)
+    if old_token:
+        data["tokens"].pop(old_token, None)
+    new_token = secrets.token_urlsafe(9)
+    data["tokens"][new_token] = user_id
+    data["user_token"][uid] = new_token
+    return new_token
+
+
+def is_blocked(data, owner_id, other_id):
+    blocked_list = data["blocks"].get(str(owner_id), [])
+    return other_id in blocked_list
+
+
+def get_conversation(data, user_a, user_b, create=True):
+    key_pair = tuple(sorted([user_a, user_b]))
+    for conv_id, conv in data["conversations"].items():
+        if tuple(sorted([conv["user_a"], conv["user_b"]])) == key_pair:
+            return conv_id, conv
+    if not create:
+        return None, None
+    conv_id = str(uuid.uuid4())
+    data["conversations"][conv_id] = {
+        "user_a": user_a, "user_b": user_b, "active": True
+    }
+    return conv_id, data["conversations"][conv_id]
+
+
+def check_rate_limit(data, sender_id):
+    now = time.time()
+    key = str(sender_id)
+    stamps = [t for t in data["rate"].get(key, []) if now - t < RATE_LIMIT_WINDOW]
+    if len(stamps) >= RATE_LIMIT_COUNT:
+        data["rate"][key] = stamps
+        return False
+    stamps.append(now)
+    data["rate"][key] = stamps
+    return True
+
+
+def check_duplicate(data, conv_id, sender_id, content):
+    now = time.time()
+    for m in reversed(data["messages"]):
+        if m["conversation_id"] != conv_id or m["sender_id"] != sender_id:
+            continue
+        if now - m["created_at"] < DUPLICATE_WINDOW and m["content"] == content:
+            return True
+        break
+    return False
+
+
+def other_side(conv, user_id):
+    return conv["user_b"] if conv["user_a"] == user_id else conv["user_a"]
+
+
+# ================= کیبوردها =================
+def confirm_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ ارسال پیام", callback_data="anon_confirm_send"),
+        InlineKeyboardButton("❌ لغو", callback_data="anon_cancel_send"),
+    ]])
+
+
+def received_keyboard(message_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 پاسخ", callback_data=f"anon_reply_{message_id}"),
+        InlineKeyboardButton("🚫 بلاک فرستنده", callback_data=f"anon_blockask_{message_id}"),
+        InlineKeyboardButton("⚠️ گزارش", callback_data=f"anon_report_{message_id}"),
+    ]])
+
+
+def reply_received_keyboard(message_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("💬 پاسخ مجدد", callback_data=f"anon_reply_{message_id}"),
+        InlineKeyboardButton("🚫 پایان گفتگو", callback_data=f"anon_end_{message_id}"),
+    ]])
+
+
+def block_confirm_keyboard(target_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ بله، بلاک کن", callback_data=f"anon_blockyes_{target_id}"),
+        InlineKeyboardButton("❌ لغو", callback_data="anon_cancel_generic"),
+    ]])
+
+
+def start_menu_keyboard():
+    rows = []
+    if MINIAPP_URL:
+        rows.append([InlineKeyboardButton("📱 باز کردن Mini App", web_app=WebAppInfo(url=MINIAPP_URL))])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+# ================= هندلرهای بات =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+
+    if args and args[0].startswith("msg_"):
+        token = args[0][4:]
+        result = mutate(lambda d: d["tokens"].get(token))
+        owner_id = result
+        if not owner_id:
+            await update.message.reply_text("❌ این لینک نامعتبر یا منقضی شده.")
+            return
+        if owner_id == user_id:
+            await update.message.reply_text("🙃 نمی‌تونی به لینک خودت پیام بفرستی.")
+            return
+
+        def check(d):
+            settings = get_settings(d, owner_id)
+            if not settings.get("receive", True):
+                return "disabled"
+            if is_blocked(d, owner_id, user_id):
+                return "blocked"
+            return "ok"
+
+        status = mutate(check)
+        if status == "disabled":
+            await update.message.reply_text("🚫 این کاربر فعلاً دریافت پیام ناشناس رو غیرفعال کرده.")
+            return
+        if status == "blocked":
+            await update.message.reply_text("🚫 امکان ارسال پیام به این کاربر وجود نداره.")
+            return
+
+        context.user_data["anon_target"] = owner_id
+        context.user_data["awaiting_anon_message"] = True
+        await update.message.reply_text("✍️ پیامت رو بنویس (به صورت کاملاً ناشناس ارسال میشه):")
+        return
+
+    token = mutate(lambda d: get_or_create_link(d, user_id))
+    link = f"https://t.me/{BOT_USERNAME}?start=msg_{token}" if BOT_USERNAME else f"(BOT_USERNAME تنظیم نشده) msg_{token}"
+    text = (
+        "👋 سلام!\n\n"
+        "اینجا می‌تونی یک لینک ناشناس اختصاصی داشته باشی و دیگران بدون اینکه هویتشون معلوم بشه برات پیام بفرستن.\n\n"
+        f"🔗 لینک ناشناس تو:\n{link}\n\n"
+        "برای مدیریت پیام‌ها، تنظیمات و کاربران بلاک‌شده از دکمه‌ی زیر وارد Mini App شو."
+    )
+    await update.message.reply_text(text, reply_markup=start_menu_keyboard())
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text or ""
+
+    # ===== نوشتن پیام جدید =====
+    if context.user_data.get("awaiting_anon_message"):
+        context.user_data["awaiting_anon_message"] = False
+        context.user_data["draft_message"] = text
+        await update.message.reply_text(
+            f"پیامت اینه:\n\n«{text}»\n\nمطمئنی می‌خوای ارسالش کنی؟",
+            reply_markup=confirm_keyboard(),
+        )
+        return
+
+    # ===== نوشتن پاسخ =====
+    if context.user_data.get("awaiting_reply_conv"):
+        conv_id = context.user_data.pop("awaiting_reply_conv")
+        await send_anon_message(context, conv_id, user_id, text, is_reply=True)
+        await update.message.reply_text("✅ پاسخ شما ارسال شد.")
+        return
+
+    # ===== نوشتن دلیل گزارش =====
+    if context.user_data.get("awaiting_report_message_id"):
+        message_id = context.user_data.pop("awaiting_report_message_id")
+
+        def do_report(d):
+            d["reports"].append({
+                "id": str(uuid.uuid4()),
+                "message_id": message_id,
+                "reporter_id": user_id,
+                "reason": text,
+                "status": "pending",
+                "created_at": time.time(),
+            })
+
+        mutate(do_report)
+        await update.message.reply_text("✅ گزارش شما ثبت شد و توسط تیم پشتیبانی بررسی میشه.")
+        return
+
+    # ===== دستورات ادمین (فقط در چت خصوصی با ادمین) =====
+    if user_id in ADMIN_IDS:
+        if text.strip() == "reports":
+            data = load_data()
+            pending = [r for r in data["reports"] if r["status"] == "pending"]
+            if not pending:
+                await update.message.reply_text("گزارش در انتظاری وجود نداره.")
+                return
+            lines = [f"#{i+1} | دلیل: {r['reason']}" for i, r in enumerate(pending[:20])]
+            await update.message.reply_text("🚩 گزارش‌های در انتظار:\n\n" + "\n".join(lines))
+            return
+        if text.startswith("block "):
+            try:
+                target = int(text.split()[1])
+            except (IndexError, ValueError):
+                await update.message.reply_text("فرمت درست: block <user_id>")
+                return
+            mutate(lambda d: d["blocks"].setdefault(str(user_id), []))
+            await update.message.reply_text(f"کاربر {target} به لیست بلاک عمومی اضافه شد (فعلاً به صورت نمادین).")
+            return
+
+
+async def send_anon_message(context, conv_id, sender_id, content, is_reply):
+    def prep(d):
+        conv = d["conversations"][conv_id]
+        recipient_id = other_side(conv, sender_id)
+        if is_blocked(d, recipient_id, sender_id):
+            return None
+        if not check_rate_limit(d, sender_id):
+            return "rate"
+        if check_duplicate(d, conv_id, sender_id, content):
+            return "duplicate"
+        msg = {
+            "id": str(uuid.uuid4()),
+            "conversation_id": conv_id,
+            "sender_id": sender_id,
+            "recipient_id": recipient_id,
+            "content": content,
+            "status": "sent",
+            "created_at": time.time(),
+            "seen_at": None,
+        }
+        d["messages"].append(msg)
+        return msg
+
+    result = mutate(prep)
+    if result in (None, "rate", "duplicate"):
+        return result
+
+    recipient_id = result["recipient_id"]
+    keyboard = reply_received_keyboard(result["id"]) if is_reply else received_keyboard(result["id"])
+    header = "📩 پاسخ به پیام ناشناس شما" if is_reply else "📩 پیام ناشناس جدید"
+    try:
+        await context.bot.send_message(
+            recipient_id, f"{header}\n\n«{content}»", reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error(f"send_anon_message failed: {e}")
+    return result
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data_str = query.data
+    user_id = query.from_user.id
+    await query.answer()
+
+    if data_str == "anon_confirm_send":
+        content = context.user_data.pop("draft_message", None)
+        target = context.user_data.pop("anon_target", None)
+        if not content or not target:
+            await query.edit_message_text("❌ پیام یافت نشد، دوباره امتحان کن.")
+            return
+
+        def make_conv(d):
+            return get_conversation(d, user_id, target)
+
+        conv_id, _ = mutate(make_conv)
+        result = await send_anon_message(context, conv_id, user_id, content, is_reply=False)
+        if result == "rate":
+            await query.edit_message_text("⏳ تعداد پیام‌های شما در این بازه زیاده، کمی صبر کن.")
+        elif result == "duplicate":
+            await query.edit_message_text("⚠️ این پیام رو همین الان فرستادی.")
+        elif result is None:
+            await query.edit_message_text("🚫 امکان ارسال پیام به این کاربر وجود نداره.")
+        else:
+            await query.edit_message_text("✅ پیام ناشناس شما ارسال شد.")
+        return
+
+    if data_str == "anon_cancel_send":
+        context.user_data.pop("draft_message", None)
+        context.user_data.pop("anon_target", None)
+        await query.edit_message_text("❌ لغو شد.")
+        return
+
+    if data_str == "anon_cancel_generic":
+        await query.edit_message_text("❌ لغو شد.")
+        return
+
+    if data_str.startswith("anon_reply_"):
+        message_id = data_str.replace("anon_reply_", "")
+        mark_seen(message_id, user_id)
+        conv_id = mutate(lambda d: next(
+            (m["conversation_id"] for m in d["messages"] if m["id"] == message_id), None
+        ))
+        if not conv_id:
+            await context.bot.send_message(user_id, "❌ این پیام دیگه در دسترس نیست.")
+            return
+        context.user_data["awaiting_reply_conv"] = conv_id
+        await context.bot.send_message(user_id, "✍️ پاسخت رو بنویس:")
+        return
+
+    if data_str.startswith("anon_blockask_"):
+        message_id = data_str.replace("anon_blockask_", "")
+        mark_seen(message_id, user_id)
+        sender_id = mutate(lambda d: next(
+            (m["sender_id"] for m in d["messages"] if m["id"] == message_id), None
+        ))
+        if not sender_id:
+            return
+        await context.bot.send_message(
+            user_id, "آیا می‌خواهید این فرستنده را بلاک کنید؟",
+            reply_markup=block_confirm_keyboard(sender_id),
+        )
+        return
+
+    if data_str.startswith("anon_blockyes_"):
+        target_id = int(data_str.replace("anon_blockyes_", ""))
+
+        def do_block(d):
+            lst = d["blocks"].setdefault(str(user_id), [])
+            if target_id not in lst:
+                lst.append(target_id)
+            conv_id, conv = get_conversation(d, user_id, target_id, create=False)
+            if conv:
+                conv["active"] = False
+
+        mutate(do_block)
+        await query.edit_message_text("✅ فرستنده بلاک شد.")
+        return
+
+    if data_str.startswith("anon_report_"):
+        message_id = data_str.replace("anon_report_", "")
+        mark_seen(message_id, user_id)
+        context.user_data["awaiting_report_message_id"] = message_id
+        await context.bot.send_message(user_id, "لطفاً دلیل گزارش رو بنویس:")
+        return
+
+    if data_str.startswith("anon_end_"):
+        message_id = data_str.replace("anon_end_", "")
+
+        def do_end(d):
+            for m in d["messages"]:
+                if m["id"] == message_id:
+                    conv = d["conversations"].get(m["conversation_id"])
+                    if conv:
+                        conv["active"] = False
+                    return
+
+        mutate(do_end)
+        await query.edit_message_text("🚫 گفتگو پایان یافت.")
+        return
+
+
+def mark_seen(message_id, viewer_id):
+    def do(d):
+        for m in d["messages"]:
+            if m["id"] == message_id and m["recipient_id"] == viewer_id and m["status"] != "seen":
+                m["status"] = "seen"
+                m["seen_at"] = time.time()
+                return m
+        return None
+
+    msg = mutate(do)
+    if msg and MAIN_LOOP:
+        def notify():
+            data = load_data()
+            settings = get_settings(data, msg["recipient_id"])
+            if settings.get("show_seen", True):
+                asyncio.run_coroutine_threadsafe(
+                    _bot_ref.send_message(msg["sender_id"], "👁 پیام شما مشاهده شد."),
+                    MAIN_LOOP,
+                )
+        notify()
+
+
+# ================= اعتبارسنجی Telegram WebApp initData =================
+def validate_init_data(init_data: str):
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except ValueError:
+        return None
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+    user_raw = parsed.get("user")
+    if not user_raw:
+        return None
+    try:
+        return json.loads(user_raw)
+    except Exception:
+        return None
+
+
+def get_authed_user_id():
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    user = validate_init_data(init_data)
+    if not user:
+        return None
+    return user.get("id")
+
+
+# ================= Flask (Mini App + API) =================
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def home():
+    return MINIAPP_HTML
+
+
+@web_app.route("/api/my-link", methods=["GET"])
+def api_my_link():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    token = mutate(lambda d: get_or_create_link(d, user_id))
+    link = f"https://t.me/{BOT_USERNAME}?start=msg_{token}"
+    return jsonify({"link": link})
+
+
+@web_app.route("/api/my-link/regenerate", methods=["POST"])
+def api_regenerate_link():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    token = mutate(lambda d: regenerate_link(d, user_id))
+    link = f"https://t.me/{BOT_USERNAME}?start=msg_{token}"
+    return jsonify({"link": link})
+
+
+@web_app.route("/api/settings", methods=["GET"])
+def api_get_settings():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    settings = mutate(lambda d: dict(get_settings(d, user_id)))
+    return jsonify(settings)
+
+
+@web_app.route("/api/settings", methods=["POST"])
+def api_set_settings():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+
+    def do(d):
+        settings = get_settings(d, user_id)
+        for key in ("receive", "notify", "show_seen"):
+            if key in body:
+                settings[key] = bool(body[key])
+        return dict(settings)
+
+    return jsonify(mutate(do))
+
+
+@web_app.route("/api/blocked", methods=["GET"])
+def api_blocked():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    blocked = mutate(lambda d: list(d["blocks"].get(str(user_id), [])))
+    items = [{"internal_id": i + 1, "ref": b} for i, b in enumerate(blocked)]
+    return jsonify(items)
+
+
+@web_app.route("/api/unblock", methods=["POST"])
+def api_unblock():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    ref = body.get("ref")
+
+    def do(d):
+        lst = d["blocks"].get(str(user_id), [])
+        if ref in lst:
+            lst.remove(ref)
+        return True
+
+    mutate(do)
+    return jsonify({"ok": True})
+
+
+@web_app.route("/api/conversations", methods=["GET"])
+def api_conversations():
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    def do(d):
+        out = []
+        for conv_id, conv in d["conversations"].items():
+            if user_id not in (conv["user_a"], conv["user_b"]):
+                continue
+            msgs = [m for m in d["messages"] if m["conversation_id"] == conv_id]
+            if not msgs:
+                continue
+            last = msgs[-1]
+            unread = sum(1 for m in msgs if m["recipient_id"] == user_id and m["status"] != "seen")
+            out.append({
+                "conversation_id": conv_id,
+                "active": conv["active"],
+                "last_message": last["content"],
+                "last_status": last["status"],
+                "unread": unread,
+                "updated_at": last["created_at"],
+            })
+        out.sort(key=lambda x: x["updated_at"], reverse=True)
+        return out
+
+    return jsonify(mutate(do))
+
+
+@web_app.route("/api/conversation/<conv_id>/messages", methods=["GET"])
+def api_conversation_messages(conv_id):
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+
+    def do(d):
+        conv = d["conversations"].get(conv_id)
+        if not conv or user_id not in (conv["user_a"], conv["user_b"]):
+            return None
+        msgs = [m for m in d["messages"] if m["conversation_id"] == conv_id]
+        for m in msgs:
+            if m["recipient_id"] == user_id and m["status"] != "seen":
+                m["status"] = "seen"
+                m["seen_at"] = time.time()
+        return [
+            {
+                "id": m["id"],
+                "mine": m["sender_id"] == user_id,
+                "content": m["content"],
+                "status": m["status"],
+                "created_at": m["created_at"],
+            }
+            for m in msgs
+        ]
+
+    result = mutate(do)
+    if result is None:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(result)
+
+
+@web_app.route("/api/conversation/<conv_id>/reply", methods=["POST"])
+def api_conversation_reply(conv_id):
+    user_id = get_authed_user_id()
+    if not user_id:
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    content = (body.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "empty"}), 400
+
+    def check(d):
+        conv = d["conversations"].get(conv_id)
+        if not conv or user_id not in (conv["user_a"], conv["user_b"]) or not conv["active"]:
+            return "invalid"
+        recipient_id = other_side(conv, user_id)
+        if is_blocked(d, recipient_id, user_id):
+            return "blocked"
+        return "ok"
+
+    status = mutate(check)
+    if status != "ok":
+        return jsonify({"error": status}), 400
+
+    if MAIN_LOOP:
+        future = asyncio.run_coroutine_threadsafe(
+            send_anon_message(_dummy_context(), conv_id, user_id, content, is_reply=True),
+            MAIN_LOOP,
+        )
+        try:
+            future.result(timeout=10)
+        except Exception as e:
+            logger.error(f"api reply send failed: {e}")
+
+    return jsonify({"ok": True})
+
+
+class _dummy_context:
+    """برای صدا زدن send_anon_message از خارج از یک آپدیت واقعی تلگرام."""
+    def __init__(self):
+        self.bot = _bot_ref
+
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+
+def keep_alive():
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
+
+
+# ================= اجرای بات =================
+_bot_ref = None  # بعد از ساخت اپلیکیشن پر میشه
+
+
+async def post_init(application):
+    global MAIN_LOOP, _bot_ref
+    MAIN_LOOP = asyncio.get_running_loop()
+    _bot_ref = application.bot
+    logger.info("anon bot ready")
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN تنظیم نشده (Environment Variables)")
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    keep_alive()
+    app.run_polling()
+
+
+MINIAPP_HTML = r"""<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>پیام ناشناس</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg-0:#121016; --bg-1:#1c1824; --surface:#211c2c;
+    --violet:#7C5CFF; --violet-soft:#a894ff; --amber:#FFC857;
+    --text-hi:#f5f3ff; --text-mid:#c9c2e0; --text-mut:#8f86ab; --stroke:#332c44;
+    --danger:#ff6b81;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;background:var(--bg-0);color:var(--text-hi);font-family:'Vazirmatn',sans-serif;}
+  body{padding:18px 16px 90px;}
+  h2{font-size:15px;margin:22px 2px 10px;color:var(--text-mid);font-weight:700;}
+  .card{background:linear-gradient(180deg,var(--surface),var(--bg-1));border:1px solid var(--stroke);border-radius:20px;padding:16px;margin-bottom:12px;}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .btn{border:none;border-radius:12px;padding:10px 14px;font-family:inherit;font-weight:700;font-size:13px;cursor:pointer;}
+  .btn-primary{background:var(--violet);color:#fff;}
+  .btn-ghost{background:transparent;border:1px solid var(--stroke);color:var(--text-mid);}
+  .btn-danger{background:rgba(255,107,129,.12);color:var(--danger);border:1px solid rgba(255,107,129,.35);}
+  .link-box{direction:ltr;text-align:left;font-family:'JetBrains Mono',monospace;font-size:11.5px;background:var(--bg-0);border:1px solid var(--stroke);border-radius:10px;padding:10px;word-break:break-all;color:var(--violet-soft);margin:10px 0;}
+  .toggle{display:flex;align-items:center;justify-content:space-between;padding:10px 2px;font-size:13.5px;}
+  .toggle + .toggle{border-top:1px solid var(--stroke);}
+  .switch{position:relative;width:42px;height:24px;border-radius:20px;background:var(--stroke);cursor:pointer;flex-shrink:0;}
+  .switch.on{background:var(--violet);}
+  .switch::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .15s;}
+  .switch.on::after{transform:translateX(18px);}
+  .conv{padding:12px;border-radius:14px;background:var(--bg-0);border:1px solid var(--stroke);margin-bottom:8px;cursor:pointer;}
+  .conv-top{display:flex;justify-content:space-between;font-size:12px;color:var(--text-mut);margin-bottom:4px;}
+  .conv-msg{font-size:13.5px;color:var(--text-hi);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .badge{background:var(--amber);color:#2a1e00;font-size:10.5px;font-weight:800;border-radius:20px;padding:2px 8px;}
+  .empty{text-align:center;color:var(--text-mut);font-size:13px;padding:20px 10px;}
+  .thread{display:none;}
+  .thread.open{display:block;}
+  .bubble{max-width:80%;padding:9px 13px;border-radius:14px;font-size:13.5px;margin-bottom:8px;line-height:1.7;}
+  .bubble.mine{background:var(--violet);color:#fff;margin-left:auto;border-bottom-left-radius:4px;}
+  .bubble.theirs{background:var(--bg-0);border:1px solid var(--stroke);margin-right:auto;border-bottom-right-radius:4px;}
+  .status{font-size:10px;opacity:.75;margin-top:4px;display:block;}
+  .composer{display:flex;gap:8px;margin-top:10px;}
+  .composer input{flex:1;background:var(--bg-0);border:1px solid var(--stroke);border-radius:12px;padding:10px 12px;color:var(--text-hi);font-family:inherit;font-size:13px;}
+  .tab-back{background:none;border:none;color:var(--violet-soft);font-weight:700;font-size:13px;margin-bottom:10px;cursor:pointer;}
+</style>
+</head>
+<body>
+
+<div id="mainView">
+  <h2>🔗 لینک ناشناس من</h2>
+  <div class="card">
+    <div class="link-box" id="myLink">در حال بارگذاری…</div>
+    <div class="row">
+      <button class="btn btn-primary" onclick="copyLink()">📋 کپی لینک</button>
+      <button class="btn btn-ghost" onclick="shareLink()">📤 اشتراک‌گذاری</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button class="btn btn-danger" onclick="regenerateLink()">🔄 ساخت لینک جدید</button>
+    </div>
+  </div>
+
+  <h2>📥 گفتگوهای ناشناس</h2>
+  <div id="convList" class="card"><div class="empty">در حال بارگذاری…</div></div>
+
+  <h2>🚫 کاربران بلاک‌شده</h2>
+  <div id="blockedList" class="card"><div class="empty">در حال بارگذاری…</div></div>
+
+  <h2>⚙️ تنظیمات</h2>
+  <div class="card">
+    <div class="toggle"><span>دریافت پیام ناشناس</span><div class="switch" id="tgl_receive" onclick="toggleSetting('receive')"></div></div>
+    <div class="toggle"><span>اعلان پیام جدید</span><div class="switch" id="tgl_notify" onclick="toggleSetting('notify')"></div></div>
+    <div class="toggle"><span>نمایش وضعیت دیده‌شدن به فرستنده</span><div class="switch" id="tgl_show_seen" onclick="toggleSetting('show_seen')"></div></div>
+  </div>
+</div>
+
+<div id="threadView" class="thread">
+  <button class="tab-back" onclick="closeThread()">→ بازگشت</button>
+  <div class="card" id="threadMessages" style="min-height:200px;"></div>
+  <div class="composer">
+    <input id="replyInput" placeholder="پاسخت رو بنویس…">
+    <button class="btn btn-primary" onclick="sendReply()">ارسال</button>
+  </div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const initData = tg?.initData || "";
+
+async function api(path, opts={}) {
+  opts.headers = Object.assign({}, opts.headers, {
+    "Content-Type": "application/json",
+    "X-Telegram-Init-Data": initData
+  });
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+let currentConvId = null;
+
+async function loadLink() {
+  const data = await api('/api/my-link');
+  document.getElementById('myLink').textContent = data.link || '—';
+}
+function copyLink(){
+  const text = document.getElementById('myLink').textContent;
+  navigator.clipboard?.writeText(text);
+  tg?.showAlert ? tg.showAlert('لینک کپی شد ✅') : alert('لینک کپی شد');
+}
+function shareLink(){
+  const text = document.getElementById('myLink').textContent;
+  if (tg) tg.openTelegramLink(`https://t.me/share/url?url=${encodeURIComponent(text)}`);
+}
+async function regenerateLink(){
+  const data = await api('/api/my-link/regenerate', {method:'POST'});
+  document.getElementById('myLink').textContent = data.link || '—';
+}
+
+async function loadSettings(){
+  const s = await api('/api/settings');
+  ['receive','notify','show_seen'].forEach(k=>{
+    document.getElementById('tgl_'+k).classList.toggle('on', !!s[k]);
+  });
+}
+async function toggleSetting(key){
+  const el = document.getElementById('tgl_'+key);
+  const newVal = !el.classList.contains('on');
+  el.classList.toggle('on', newVal);
+  await api('/api/settings', {method:'POST', body: JSON.stringify({[key]: newVal})});
+}
+
+function timeAgo(ts){
+  const diff = Date.now()/1000 - ts;
+  if (diff < 60) return 'همین الان';
+  if (diff < 3600) return Math.floor(diff/60)+' دقیقه پیش';
+  if (diff < 86400) return Math.floor(diff/3600)+' ساعت پیش';
+  return Math.floor(diff/86400)+' روز پیش';
+}
+
+async function loadConversations(){
+  const list = await api('/api/conversations');
+  const el = document.getElementById('convList');
+  if (!list.length) { el.innerHTML = '<div class="empty">هنوز گفتگویی نداری.</div>'; return; }
+  el.innerHTML = list.map(c => `
+    <div class="conv" onclick="openThread('${c.conversation_id}')">
+      <div class="conv-top">
+        <span>${timeAgo(c.updated_at)}</span>
+        ${c.unread ? `<span class="badge">${c.unread} جدید</span>` : ''}
+      </div>
+      <div class="conv-msg">${escapeHtml(c.last_message)}</div>
+    </div>
+  `).join('');
+}
+
+async function loadBlocked(){
+  const list = await api('/api/blocked');
+  const el = document.getElementById('blockedList');
+  if (!list.length) { el.innerHTML = '<div class="empty">کاربر بلاک‌شده‌ای نداری.</div>'; return; }
+  el.innerHTML = list.map(b => `
+    <div class="row" style="padding:8px 0;border-top:1px solid var(--stroke);">
+      <span>کاربر مسدود #${b.internal_id}</span>
+      <button class="btn btn-ghost" onclick="unblock(${JSON.stringify(b.ref)})">آنبلاک</button>
+    </div>
+  `).join('');
+}
+async function unblock(ref){
+  await api('/api/unblock', {method:'POST', body: JSON.stringify({ref})});
+  loadBlocked();
+}
+
+function escapeHtml(s){
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function openThread(convId){
+  currentConvId = convId;
+  document.getElementById('mainView').style.display = 'none';
+  document.getElementById('threadView').classList.add('open');
+  await renderThread();
+}
+function closeThread(){
+  currentConvId = null;
+  document.getElementById('threadView').classList.remove('open');
+  document.getElementById('mainView').style.display = 'block';
+  loadConversations();
+}
+async function renderThread(){
+  const msgs = await api(`/api/conversation/${currentConvId}/messages`);
+  const el = document.getElementById('threadMessages');
+  if (!Array.isArray(msgs)) { el.innerHTML = '<div class="empty">این گفتگو در دسترس نیست.</div>'; return; }
+  el.innerHTML = msgs.map(m => `
+    <div class="bubble ${m.mine ? 'mine' : 'theirs'}">
+      ${escapeHtml(m.content)}
+      ${m.mine ? `<span class="status">${m.status === 'seen' ? '👁 دیده شد' : '✓ ارسال شد'}</span>` : ''}
+    </div>
+  `).join('');
+}
+async function sendReply(){
+  const input = document.getElementById('replyInput');
+  const content = input.value.trim();
+  if (!content) return;
+  input.value = '';
+  await api(`/api/conversation/${currentConvId}/reply`, {method:'POST', body: JSON.stringify({content})});
+  await renderThread();
+}
+
+loadLink();
+loadSettings();
+loadConversations();
+loadBlocked();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
